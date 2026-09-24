@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { generateInviteToken, hashInviteToken, inviteExpiry } from "./inviteTokens";
 import { hashPassword, validatePasswordStrength } from "../auth/passwordService";
@@ -129,7 +130,7 @@ export async function acceptInvite(input: AcceptInviteInput): Promise<{ userId: 
 
   const passwordHash = await hashPassword(input.password);
 
-  const user = await prisma.$transaction(async (tx: typeof prisma) => {
+  const user = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const createdUser = await tx.user.create({
       data: {
         practiceId: invite.practiceId,
