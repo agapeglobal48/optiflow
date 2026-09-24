@@ -1,0 +1,598 @@
+// OptiFlow Core Data Model
+// Design principles (per build spec section 7.1):
+// - UUID/opaque identifiers everywhere; never expose sequential IDs
+// - Every business object carries tenant (practice) ownership
+// - No clinical data fields anywhere in this schema
+// - Soft delete via deletedAt where operational recovery matters
+// - Indexes on tenant ownership + frequent filters + webhook/provider IDs
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// TENANCY
+// ─────────────────────────────────────────────────────────────
+
+enum PracticeStatus {
+  PENDING_SETUP
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+}
+
+model Practice {
+  id        String         @id @default(uuid())
+  name      String
+  timezone  String         @default("Europe/London")
+  status    PracticeStatus @default(PENDING_SETUP)
+
+  // true only for the single internal OptiFlow "practice" row that platform
+  // staff (super-admins) belong to. This keeps User.practiceId non-null
+  // and required everywhere, instead of introducing nullable tenant logic
+  // just for one internal edge case.
+  isPlatform Boolean @default(false)
+
+  // Each practice has its own WhatsApp Business phone number in a real
+  // deployment. Inbound webhooks from Meta include which phone_number_id
+  // received the message - this is how we route an inbound webhook to the
+  // correct tenant, since the webhook payload itself carries no OptiFlow
+  // practiceId.
+  whatsappPhoneNumberId String? @unique
+
+  // reporting estimate config (spec 5.2 / 5.9) - never used for real billing
+  defaultAppointmentValue Decimal? @db.Decimal(10, 2)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  branches         Branch[]
+  users            User[]
+  customers        Customer[]
+  campaigns        Campaign[]
+  conversations    Conversation[]
+  auditLogs        AuditLog[]
+  knowledgeEntries KnowledgeEntry[]
+  suppressions     SuppressionEntry[]
+  featureFlags     PracticeFeatureFlag[]
+  aiSettings       AiSettings?
+  roles            Role[]
+  invites          Invite[]
+  importBatches    ImportBatch[]
+  appointments     Appointment[]
+
+  @@index([status])
+}
+
+model Branch {
+  id         String    @id @default(uuid())
+  practiceId String
+  practice   Practice  @relation(fields: [practiceId], references: [id])
+
+  name       String
+  address    String?
+  contactPhone String?
+  contactEmail String?
+  workingHours Json?   // structured open hours per day
+
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+
+  customers     Customer[]
+  appointments  Appointment[]
+
+  @@index([practiceId])
+}
+
+// Staff/owner invitations. Nobody gets a password set on their behalf -
+// they always set their own via this token flow (spec 5.1 pattern extended
+// to onboarding). Tokens are stored hashed, same rationale as refresh tokens.
+model Invite {
+  id         String   @id @default(uuid())
+  practiceId String
+  practice   Practice @relation(fields: [practiceId], references: [id])
+
+  email      String
+  roleId     String
+  role       Role     @relation(fields: [roleId], references: [id])
+
+  tokenHash  String   @unique
+  invitedByUserId String?
+
+  expiresAt  DateTime
+  acceptedAt DateTime?
+  revokedAt  DateTime?
+
+  createdAt  DateTime @default(now())
+
+  @@index([practiceId])
+  @@index([email])
+}
+
+// ─────────────────────────────────────────────────────────────
+// AUTH, USERS & PERMISSION-BASED RBAC
+// (spec section 3 + 5.1: permission-based, not hard-coded by role name)
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  practiceId   String
+  practice     Practice @relation(fields: [practiceId], references: [id])
+
+  email        String
+  passwordHash String
+  firstName    String
+  lastName     String
+
+  roleId       String
+  role         Role     @relation(fields: [roleId], references: [id])
+
+  mfaEnabled     Boolean  @default(false)
+  mfaSecretEnc   String?  // encrypted at rest, never plaintext
+
+  isActive       Boolean  @default(true)
+  failedLoginCount Int    @default(0)
+  lockedUntil    DateTime?
+
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  sessions       Session[]
+  auditLogs      AuditLog[]
+  assignedConvos Conversation[] @relation("AssignedAgent")
+
+  @@unique([practiceId, email]) // email unique per tenant, not globally
+  @@index([practiceId])
+}
+
+// Roles are practice-scoped so a practice can define custom profiles later
+// without touching code (spec section 3: "permission-based rather than
+// hard-coded only by role name").
+model Role {
+  id         String   @id @default(uuid())
+  practiceId String?  // null = system-defined global role template
+  practice   Practice? @relation(fields: [practiceId], references: [id])
+
+  name        String   // e.g. "Practice Admin", "Front Desk", "Super Admin"
+  description String?
+  isSystem    Boolean  @default(false) // true for OptiFlow-defined baseline roles
+
+  permissions RolePermission[]
+  users       User[]
+  invites     Invite[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([practiceId])
+}
+
+// Fixed catalogue of permission keys the codebase checks against.
+// New roles are just new combinations of these - no code changes needed.
+model Permission {
+  id          String   @id @default(uuid())
+  key         String   @unique // e.g. "customers:import", "campaigns:launch", "ai:kill_switch"
+  description String
+
+  roles RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  role         Role       @relation(fields: [roleId], references: [id])
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id])
+
+  @@id([roleId, permissionId])
+}
+
+// Sessions tracked explicitly so we can revoke on role change / disable
+// (spec 5.1: "Session revocation required when staff are disabled or roles change")
+model Session {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  refreshTokenHash String
+  userAgent    String?
+  ipAddress    String?
+  revokedAt    DateTime?
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// CUSTOMER / RECALL DATA (non-clinical only, per spec 7.1)
+// ─────────────────────────────────────────────────────────────
+
+enum ConsentStatus {
+  OPTED_IN
+  OPTED_OUT
+  UNKNOWN
+}
+
+model Customer {
+  id          String   @id @default(uuid())
+  practiceId  String
+  practice    Practice @relation(fields: [practiceId], references: [id])
+  branchId    String?
+  branch      Branch?  @relation(fields: [branchId], references: [id])
+
+  externalId  String?  // customer ID from source system, if any
+  firstName   String
+  lastName    String?
+  email       String?
+  mobile      String?
+  preferredChannel String? // whatsapp | sms | email
+
+  recallDueDate    DateTime?
+  appointmentType  String?  // free text / configurable label, no clinical detail
+
+  consentStatus    ConsentStatus @default(UNKNOWN)
+  importSource     String?  // filename/batch reference of CSV import
+  importBatchId    String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+  anonymisedAt DateTime? // retention policy support - PII cleared, aggregates kept
+
+  campaignRecipients CampaignRecipient[]
+  conversations      Conversation[]
+  appointments       Appointment[]
+
+  @@index([practiceId])
+  @@index([practiceId, recallDueDate])
+  @@index([practiceId, mobile])
+  @@unique([practiceId, externalId]) // idempotent import support
+}
+
+// Records the outcome of a single CSV import - a "receipt" so staff can see
+// what happened without re-checking every customer row individually.
+model ImportBatch {
+  id         String   @id @default(uuid())
+  practiceId String
+  practice   Practice @relation(fields: [practiceId], references: [id])
+
+  filename        String
+  status          String // "completed" | "failed"
+  totalRows       Int
+  importedCount   Int // new customers created
+  updatedCount    Int // existing customers matched by externalId and updated
+  skippedCount    Int // rows that failed validation
+  errors          Json // [{ row: number, message: string }]
+  warnings        Json // [{ row: number, message: string }] - non-fatal issues
+
+  createdByUserId String?
+  createdAt       DateTime  @default(now())
+  completedAt     DateTime?
+
+  @@index([practiceId])
+}
+
+model SuppressionEntry {
+  id         String   @id @default(uuid())
+  practiceId String
+  practice   Practice @relation(fields: [practiceId], references: [id])
+
+  mobile     String?
+  email      String?
+  reason     String   // "opt_out" | "bounced" | "manual"
+  createdAt  DateTime @default(now())
+
+  @@index([practiceId])
+  @@index([practiceId, mobile])
+  @@index([practiceId, email])
+}
+
+// ─────────────────────────────────────────────────────────────
+// CAMPAIGNS
+// ─────────────────────────────────────────────────────────────
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  RUNNING
+  PAUSED
+  COMPLETED
+  STOPPED
+}
+
+model CampaignTemplateType {
+  id          String @id @default(uuid())
+  key         String @unique // "eye_test_recall" | "contact_lens_recall" | "lapsed_reactivation" | "no_show_recovery" | custom
+  label       String
+  description String?
+
+  campaigns Campaign[]
+}
+
+model Campaign {
+  id         String   @id @default(uuid())
+  practiceId String
+  practice   Practice @relation(fields: [practiceId], references: [id])
+
+  templateTypeId String
+  templateType   CampaignTemplateType @relation(fields: [templateTypeId], references: [id])
+
+  name           String
+  messageTemplateId String
+  messageTemplate   MessageTemplate @relation(fields: [messageTemplateId], references: [id])
+
+  audienceFilter Json    // structured filter: due date range, branch, status, fields
+  status         CampaignStatus @default(DRAFT)
+
+  scheduledAt    DateTime?
+  launchedAt     DateTime?
+  completedAt    DateTime?
+
+  estimatedAudienceSize Int?
+  suppressedCount       Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  recipients CampaignRecipient[]
+
+  @@index([practiceId])
+  @@index([practiceId, status])
+}
+
+model MessageTemplate {
+  id           String   @id @default(uuid())
+  practiceId   String
+  name         String
+  channel      String   // "whatsapp"
+  providerTemplateName String // name registered with WhatsApp/BSP
+  bodyPreview  String   // human-readable preview with {{variables}}
+  isApproved   Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaigns Campaign[]
+
+  @@index([practiceId])
+}
+
+// Immutable attribution record - the spec explicitly requires this to
+// survive even if the underlying customer is later anonymised.
+model CampaignRecipient {
+  id          String   @id @default(uuid())
+  campaignId  String
+  campaign    Campaign @relation(fields: [campaignId], references: [id])
+  customerId  String?
+  customer    Customer? @relation(fields: [customerId], references: [id])
+
+  // snapshot fields survive customer anonymisation (spec 5.4)
+  snapshotName    String
+  snapshotChannel String
+  snapshotContact String // mobile or email at launch time - NOT re-fetched from
+  // Customer at send time, so a later contact-info change or anonymisation
+  // can't silently redirect or break an already-queued send.
+
+  status      String   // "queued" | "sent" | "delivered" | "failed" | "replied" | "booked"
+  sentAt      DateTime?
+  deliveredAt DateTime?
+  repliedAt   DateTime?
+  bookedAt    DateTime?
+  failureReason String?
+
+  createdAt DateTime @default(now())
+
+  messages Message[]
+
+  @@index([campaignId])
+  @@index([customerId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// MESSAGING & CONVERSATIONS
+// ─────────────────────────────────────────────────────────────
+
+enum ConversationStatus {
+  AI_HANDLING
+  WAITING_ON_CUSTOMER
+  HUMAN_QUEUE
+  HUMAN_HANDLING
+  BOOKED
+  CLOSED
+}
+
+model Conversation {
+  id         String   @id @default(uuid())
+  practiceId String
+  practice   Practice @relation(fields: [practiceId], references: [id])
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  status         ConversationStatus @default(AI_HANDLING)
+  aiAutoSendPaused Boolean @default(false) // per-conversation kill switch (TAKE OVER)
+
+  assignedAgentId String?
+  assignedAgent   User?   @relation("AssignedAgent", fields: [assignedAgentId], references: [id])
+
+  lastMessageAt DateTime?
+  unreadCount   Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages Message[]
+
+  @@index([practiceId])
+  @@index([practiceId, status])
+  @@index([customerId])
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageSender {
+  CUSTOMER
+  AI
+  STAFF
+  SYSTEM
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  campaignRecipientId String?
+  campaignRecipient   CampaignRecipient? @relation(fields: [campaignRecipientId], references: [id])
+
+  direction   MessageDirection
+  sender      MessageSender
+  channel     String   // "whatsapp"
+  body        String
+
+  providerMessageId String? // for webhook dedup / status tracking
+  status            String? // "queued" | "sent" | "delivered" | "read" | "failed"
+  errorDetail       String?
+
+  // AI traceability (spec 5.6 / 11: must be traceable to model/version/prompt version)
+  aiModel           String?
+  aiPromptVersion   String?
+  aiConfidence      Decimal? @db.Decimal(4, 3)
+
+  isInternalNote Boolean @default(false) // never sent to patient
+
+  createdAt DateTime @default(now())
+
+  @@index([conversationId])
+  @@unique([providerMessageId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// KNOWLEDGE BASE (for AI - non-clinical FAQs only)
+// ─────────────────────────────────────────────────────────────
+
+model KnowledgeEntry {
+  id         String   @id @default(uuid())
+  practiceId String
+  practice   Practice @relation(fields: [practiceId], references: [id])
+
+  topic      String   // "services" | "prices" | "hours" | "faq" | "escalation"
+  question   String?
+  answer     String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([practiceId])
+}
+
+model AiSettings {
+  id         String   @id @default(uuid())
+  practiceId String   @unique
+  practice   Practice @relation(fields: [practiceId], references: [id])
+
+  autoSendEnabled   Boolean @default(true) // global per-practice kill switch
+  confidenceThreshold Decimal @default(0.75) @db.Decimal(4, 3)
+  blocklistTerms    Json    @default("[]")
+  promptVersion     String  @default("v1")
+
+  updatedAt DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────────────────────
+// BOOKING
+// ─────────────────────────────────────────────────────────────
+
+enum AppointmentStatus {
+  BOOKED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+model Appointment {
+  id         String   @id @default(uuid())
+  practiceId String
+  practice   Practice @relation(fields: [practiceId], references: [id])
+  branchId   String
+  branch     Branch   @relation(fields: [branchId], references: [id])
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  appointmentType String
+  startTime  DateTime
+  endTime    DateTime
+  status     AppointmentStatus @default(BOOKED)
+
+  source     String   // "internal" | "external_calendar"
+  externalRef String? // ID in external calendar system if applicable (stub - never populated yet, see bookings/externalCalendarSync.ts)
+
+  campaignId     String? // attribution link back to originating campaign
+  conversationId String? // attribution link back to the WhatsApp conversation that produced this booking, if any
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // prevents double booking: unique constraint on branch+slot for internal source
+  @@unique([branchId, startTime, source])
+  @@index([practiceId])
+  @@index([customerId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// OPERATIONS: AUDIT, FEATURE FLAGS
+// ─────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  practiceId String?
+  practice   Practice? @relation(fields: [practiceId], references: [id])
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+
+  action     String   // e.g. "campaign.launch", "customer.import", "ai.kill_switch.toggle"
+  entityType String?
+  entityId   String?
+  metadata   Json?
+
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([practiceId])
+  @@index([userId])
+  @@index([action])
+}
+
+model PracticeFeatureFlag {
+  id         String   @id @default(uuid())
+  practiceId String
+  practice   Practice @relation(fields: [practiceId], references: [id])
+
+  key        String
+  enabled    Boolean  @default(false)
+
+  @@unique([practiceId, key])
+}
+
+// Raw webhook event log for traceability + dedup (spec 8.2)
+model WebhookEvent {
+  id             String   @id @default(uuid())
+  provider       String   // "whatsapp_cloud_api" | "bsp_adapter"
+  providerEventId String  @unique
+  eventType      String
+  payload        Json
+  status         String   @default("received") // received | processed | failed | dead_letter
+  processingError String?
+  receivedAt     DateTime @default(now())
+  processedAt    DateTime?
+
+  @@index([status])
+}
